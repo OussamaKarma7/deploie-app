@@ -14,3 +14,8 @@ dynamic = ["version"]
 
 [tool.maturin]
 features = ["cpython/extension-module"]
+
+[tool.poetry.dependencies]
+python = "^3.6"
+torch = {version = "^1.0", features = ["torch"]}
+transformers = "^4.10"
