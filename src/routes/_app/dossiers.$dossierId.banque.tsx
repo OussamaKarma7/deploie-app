@@ -463,7 +463,7 @@ function BanquePage() {
     const [{data:c},{data:r},{data:fc},{data:ff},{data:fo},{data:cl},{data:dos}]=await Promise.all([
       (supabase.from("comptes_bancaires") as any).select("*").eq("dossier_id",dossierId).order("created_at"),
       (supabase.from("releves_bancaires") as any).select("*").eq("dossier_id",dossierId).order("created_at",{ascending:false}),
-      supabase.from("factures").select("id,numero,montant_ttc,montant_ht,montant_tva,montant_paye,montant_restant,type_facture,date_facture,date_echeance,client_id,mode_reglement,clients(id,nom,ice,if_fiscal,rc,adresse,ville)").eq("dossier_id",dossierId).eq("statut","conforme").neq("statut_paiement","payee"),
+      supabase.from("factures").select("id,numero,montant_ttc,montant_ht,montant_tva,montant_paye,montant_restant,type_facture,date_facture,date_echeance,client_id,mode_reglement,clients(id,nom,ice)").eq("dossier_id",dossierId).eq("statut","conforme").neq("statut_paiement","payee"),
       (supabase.from("factures_fournisseurs") as any).select("id,numero,montant_ttc,montant_ht,montant_tva,montant_paye,montant_restant,date_facture,date_echeance,fournisseur_nom,fournisseur_id,mode_reglement").eq("dossier_id",dossierId).neq("statut_paiement","payee"),
       (supabase.from("fournisseurs") as any).select("id,nom,ice,if_fiscal,rc,adresse,ville").eq("dossier_id",dossierId),
       supabase.from("clients").select("id,nom,ice,if_fiscal,rc,adresse,ville").eq("dossier_id",dossierId),
@@ -567,7 +567,31 @@ function BanquePage() {
         };
       });
 
-      setTxExtraites(txFinal);
+      // Post-traitement: forcer l'unicité + montant exact pour fournisseurs uniquement
+      const usedFacIds = new Set<string>();
+      const txFinalUnique = txFinal.map(tx => {
+        if (!tx.facture_id) return tx;
+        // Vérifier unicité
+        if (usedFacIds.has(tx.facture_id)) {
+          return { ...tx, facture_id: null, reference_facture: null, alerte: "Facture déjà matchée avec une autre transaction" };
+        }
+        // Pour factures fournisseurs: vérifier montant exact
+        if (tx.type === "debit") {
+          const fac = (facturesFourn as any[]).find((f:any) => f.id === tx.facture_id);
+          if (fac) {
+            const ttc = Number(fac.montant_ttc);
+            const restant = Number(fac.montant_restant || fac.montant_ttc);
+            const montantOk = Math.abs(tx.montant - ttc) < 1 || Math.abs(tx.montant - restant) < 1;
+            if (!montantOk) {
+              return { ...tx, facture_id: null, reference_facture: null, alerte: "Montant inexact — vérifiez manuellement" };
+            }
+          }
+        }
+        usedFacIds.add(tx.facture_id);
+        return tx;
+      });
+
+      setTxExtraites(txFinalUnique);
       setScanStep("review");
       const nbMatch=txFinal.filter(t=>t.facture_id).length;
       toast.success(`${txFinal.length} transactions analysées${nbMatch>0?` — ${nbMatch} matchées avec factures`:""}`);
@@ -712,31 +736,41 @@ function BanquePage() {
         if(!facId && isCr){
           const libUp = tx.libelle.toUpperCase();
           const matched = (facturesClient as any[]).find((f:any)=>{
+            // Règle unicité: facture déjà matchée → ignorer
+            if(fcPay.includes(f.id)) return false;
             const ttc = Number(f.montant_ttc);
             const restant = Number(f.montant_restant||f.montant_ttc);
-            // Critère B: montant exact (ttc ou restant ±1 MAD) — condition forte
+            // Montant EXACT ±1 MAD — condition bloquante
             const montantOk = Math.abs(tx.montant - ttc) < 1 || Math.abs(tx.montant - restant) < 1;
             if(!montantOk) return false;
-            // Critère A: nom client (prioritaire mais non bloquant)
             const clientNom = (f.clients?.nom||"").toUpperCase();
-            if(!clientNom) return true; // pas de nom → accepter sur montant seul
+            if(!clientNom) return true;
             const words = clientNom.split(/\s+/).filter((w:string)=>w.length>=3);
-            const nomMatch = words.some((w:string)=>libUp.includes(w) || libUp.includes(w.slice(0,3)));
-            return nomMatch; // nom doit matcher si disponible
+            return words.some((w:string)=>libUp.includes(w) || libUp.includes(w.slice(0,3)));
           });
           if(matched) facId = matched.id;
         }
         if(!facId && !isCr){
           const libUp = tx.libelle.toUpperCase();
           const matched = (facturesFourn as any[]).find((f:any)=>{
+            // Règle unicité: facture déjà matchée → ignorer
+            if(ffPay.includes(f.id)) return false;
             const ttc = Number(f.montant_ttc);
             const restant = Number(f.montant_restant||f.montant_ttc);
+            // Montant EXACT ±1 MAD — condition bloquante
             const montantOk = Math.abs(tx.montant - ttc) < 1 || Math.abs(tx.montant - restant) < 1;
             if(!montantOk) return false;
             const fourn = (f.fournisseur_nom||"").toUpperCase();
             if(!fourn) return true;
             const words = fourn.split(/\s+/).filter((w:string)=>w.length>=3);
-            return words.some((w:string)=>libUp.includes(w) || libUp.includes(w.slice(0,3)));
+            // Mode règlement cohérent
+            const modeOk = !f.mode_reglement || 
+              (libUp.includes("CHEQUE") && f.mode_reglement==="cheque") ||
+              (libUp.includes(" CB ") && f.mode_reglement==="carte") ||
+              (libUp.includes("VIR") && f.mode_reglement==="virement") ||
+              (!libUp.includes("CHEQUE") && !libUp.includes(" CB ") && !libUp.includes("VIR"));
+            const nomMatch = words.some((w:string)=>libUp.includes(w) || libUp.includes(w.slice(0,3)));
+            return nomMatch && modeOk;
           });
           if(matched) facId = matched.id;
         }

@@ -18,15 +18,25 @@ const ligneSchema = z.object({
   taux_tva: z.number().min(0).max(100).default(20),
 });
 
-async function envoyerEmail(to: string, subject: string, html: string): Promise<boolean> {
-  const resendKey = process.env.RESEND_API_KEY;
-  const fromEmail = process.env.FROM_EMAIL ?? "onboarding@resend.dev";
-  if (!resendKey) return false;
+async function envoyerEmail(to: string, subject: string, html: string, attachments?: {name:string;content:string;type:string}[]): Promise<boolean> {
+  const brevoKey = process.env.BREVO_API_KEY ?? "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";
+  const fromEmail = process.env.FROM_EMAIL ?? "noreply@hisabpro.ma";
+  const fromName = process.env.FROM_NAME ?? "HisabPro";
+  if (!brevoKey) return false;
   try {
-    const res = await fetch("https://api.resend.com/emails", {
+    const body: any = {
+      sender: { name: fromName, email: fromEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    };
+    if (attachments?.length) {
+      body.attachment = attachments.map(a => ({ name: a.name, content: a.content }));
+    }
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
       method: "POST",
-      headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: `HisabPro <${fromEmail}>`, to: [to], subject, html }),
+      headers: { "api-key": brevoKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
     return res.ok;
   } catch { return false; }
@@ -230,13 +240,27 @@ RÈGLES:
 - ÉMETTEUR = société en en-tête avec RC/IF/ICE
 - CLIENT = après "Client:", "Facturer à:", "Bill to:", bloc CLIENT
 - sens_facture: "client" si ${dossierNom} est émetteur, "fournisseur" si client, sinon "inconnu"
-- type_facture: "acompte" si acompte/avance/reliquat présents, "avoir" si avoir/remboursement, "standard" sinon
-- Pour acompte: montant_ttc = montant de CETTE facture seulement, montant_restant_du = reliquat
+- type_facture: "acompte" si mots acompte/avance/accompte présents, "avoir" si avoir/remboursement, "standard" sinon
 - Dates: convertir DD/MM/YYYY → YYYY-MM-DD. ICE = 15 chiffres exactement.
-${text ? `\nTEXTE FACTURE:\n${text.slice(0,2000)}` : ""}
+- mode_reglement: détecter depuis la facture: "carte"|"cheque"|"virement"|"especes"|"prelevement" — si absent mettre "virement"
+
+RÈGLES CRITIQUES POUR FACTURE ACOMPTE:
+Une facture acompte contient DEUX montants distincts:
+1. Le montant de l'acompte (ce que le client paie maintenant) → c'est montant_ttc
+2. Le montant total de la commande (montant global du contrat) → c'est montant_commande_total_ttc
+3. Le reliquat (total - acompte) → c'est montant_restant_du
+
+COMMENT IDENTIFIER:
+- montant_ttc = ligne "Net à payer" OU "Montant acompte" OU "Total TTC" de CETTE facture = le plus petit montant
+- montant_commande_total_ttc = ligne "Montant total commande" OU "Montant total marché" = le plus grand montant
+- montant_restant_du = ligne "Reste à payer" OU "Reliquat" = différence entre les deux
+- NE JAMAIS mettre le montant total commande dans montant_ttc pour une facture acompte
+${text ? `
+TEXTE FACTURE:
+${text.slice(0,2000)}` : ""}
 
 JSON EXACT (remplace les valeurs):
-{"sens_facture":"client","emetteur_nom":"","emetteur_ice":null,"client_nom":"","client_ice":null,"client_adresse":null,"numero":null,"date":null,"date_echeance":null,"type_facture":"standard","numero_commande":null,"numero_acompte":null,"montant_ht":0,"montant_tva":0,"taux_tva":20,"montant_ttc":0,"montant_commande_total_ht":null,"montant_commande_total_ttc":null,"montant_restant_du":null,"description":"","lignes":[{"description":"","quantite":1,"prix_unitaire_ht":0,"total_ht":0,"taux_tva":20}]}`;
+{"sens_facture":"client","emetteur_nom":"","emetteur_ice":null,"client_nom":"","client_ice":null,"client_adresse":null,"numero":null,"date":null,"date_echeance":null,"type_facture":"standard","numero_commande":null,"numero_acompte":null,"montant_ht":0,"montant_tva":0,"taux_tva":20,"montant_ttc":0,"montant_commande_total_ht":null,"montant_commande_total_ttc":null,"montant_restant_du":null,"description":"","mode_reglement":"virement","lignes":[{"description":"","quantite":1,"prix_unitaire_ht":0,"total_ht":0,"taux_tva":20}]}`;
 
     try {
       const aiResponse = await callAI(prompt, data.image_base64, data.mime_type);
@@ -261,6 +285,7 @@ JSON EXACT (remplace les valeurs):
         montant_commande_total_ht:  Number(ai.montant_commande_total_ht)  || null,
         montant_commande_total_ttc: Number(ai.montant_commande_total_ttc) || null,
         montant_restant_du:         Number(ai.montant_restant_du)         || null,
+        mode_reglement:             ai.mode_reglement                    ?? "virement",
         lignes: (ai.lignes ?? []).map((l: any) => ({
           designation:   l.description ?? l.designation ?? "Prestation",
           quantite:      Number(l.quantite)                             || 1,
@@ -464,28 +489,37 @@ ALGORITHME (ordre strict)
   → Si nom identifié: +35 points de confiance
   → Si nom absent ou non reconnu: 0 points (continuer avec B+C+D)
 
-  CRITÈRE B — MONTANT (condition forte):
+  CRITÈRE B — MONTANT (condition BLOQUANTE):
   Comparer le montant de la transaction avec, pour chaque facture:
   - montant_ttc ±1 MAD → +30 points (paiement total)
   - restant ±1 MAD → +30 points (paiement du solde restant)
-  Si aucun match montant: -20 points (forte pénalité)
-  NE PAS accepter de montant partiel sans nom tiers identifié.
+  Si aucun match montant exact: score = 0, pas de match possible — RÈGLE ABSOLUE
+  NE JAMAIS matcher une facture de 433 MAD avec une transaction de 460 MAD
+  NE JAMAIS matcher une facture de 460 MAD avec une transaction de 433 MAD
+  Le montant doit correspondre à ±1 MAD près — sans exception.
 
-  CRITÈRE C — MODE DE RÈGLEMENT (améliore précision):
+  CRITÈRE C — MODE DE RÈGLEMENT (important):
   Déduire le moyen depuis le libellé: "VIREMENT"→virement, "CHEQUE"→cheque, "CB"→carte
   Comparer avec mode_reglement de la facture:
   → Cohérent: +20 points
-  → Incohérent: -5 points (non bloquant, signaler dans alerte)
+  → Incohérent: -15 points (pénalité forte — une facture CB ne peut pas être payée par chèque)
   → Absent des deux côtés: 0 points
+  RÈGLE: Si mode incohérent ET montant similaire → NE PAS matcher, chercher autre facture
 
   CRITÈRE D — DATE:
   date_transaction ≤ date_echeance + 15 jours → +15 points
-  date_transaction > date_echeance + 15 jours → -10 points (signaler alerte)
+  date_transaction entre date_facture et date_echeance + 30 jours → normal
+  date_transaction > date_echeance + 30 jours → -15 points (signaler alerte retard)
+  date_transaction < date_facture → -30 points (impossible de payer avant la facture)
 
   DÉCISION:
   Score ≥ 80 → retourner facture_id, confiance = score %
   Score 60-79 → retourner facture_id avec alerte de doute, confiance = score %
   Score < 60 → pas de match facture, passer au niveau 3
+
+  RÈGLE UNICITÉ (ABSOLUE): Chaque facture_id ne peut apparaître qu'UNE SEULE FOIS dans les analyses.
+  Si une facture est déjà matchée à une transaction précédente, NE PAS la matcher à nouveau.
+  En cas de 2 transactions similaires, matcher chacune avec SA facture correspondante (montant exact).
 
   RÈGLE CHÈQUE SANS NOM:
   Si moyen = CHEQUE et aucun nom tiers extrait:
@@ -601,6 +635,8 @@ Catégories valides: encaissement_client|paiement_fournisseur|salaires|cnss_amo|
     console.log(`[RELEVE AI] Groq OK — ${parsed.analyses.length} analyses, ${parsed.analyses.filter((a: any) => a.facture_id).length} matchées`);
     return parsed;
   });
+
+
 
 
 
